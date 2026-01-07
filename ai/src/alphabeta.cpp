@@ -312,12 +312,22 @@ Move AlphaBeta::iterative_deepening_time(const GameState& state,
 Move AlphaBeta::search(const GameState& s, int max_depth, int time_ms) {
   stats_.reset();
   
-  std::cerr << "[AlphaBeta] Starting search (depth=" << max_depth << ", time_ms=" << time_ms << ")..." << std::endl;
-  
-  if (time_ms > 0) {
+  // Determine effective time limit (ms). If time_ms <= 0, allow env var CONTRAST_MOVE_TIME (seconds).
+  int effective_time_ms = time_ms;
+  if (effective_time_ms <= 0) {
+    const char* env = std::getenv("CONTRAST_MOVE_TIME");
+    if (env) {
+      double secs = std::atof(env);
+      if (secs > 0.0) effective_time_ms = static_cast<int>(secs * 1000.0);
+    }
+  }
+
+  std::cerr << "[AlphaBeta] Starting search (depth=" << max_depth << ", time_ms=" << effective_time_ms << ")..." << std::endl;
+
+  if (effective_time_ms > 0) {
     // 時間指定の場合は反復深化
     auto start_time = std::chrono::steady_clock::now();
-    auto deadline = start_time + std::chrono::milliseconds(time_ms);
+    auto deadline = start_time + std::chrono::milliseconds(effective_time_ms);
     Move best_move = iterative_deepening_time(s, deadline);
     
     auto end_time = std::chrono::steady_clock::now();

@@ -3,6 +3,8 @@
 #include "contrast/move_list.hpp"
 #include "rule_based_policy.hpp"
 #include "random_policy.hpp"
+#include "mcts.hpp"
+#include "alphabeta.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -166,7 +168,7 @@ void run_match_series(const PolicyBinding& black_policy, const PolicyBinding& wh
     std::cout << "======================================\n";
 }
 
-enum class PolicyChoice { Rule, Random };
+enum class PolicyChoice { Rule, Random, MCTS, AlphaBeta };
 
 std::string to_lower_copy(std::string_view text) {
     std::string lowered(text);
@@ -187,6 +189,12 @@ PolicyChoice parse_policy_choice(std::string_view text) {
     }
     if (lowered == "rule" || lowered == "rulebased") {
         return PolicyChoice::Rule;
+    }
+    if (lowered == "mcts") {
+        return PolicyChoice::MCTS;
+    }
+    if (lowered == "alphabeta" || lowered == "ab") {
+        return PolicyChoice::AlphaBeta;
     }
     throw std::invalid_argument("Unsupported policy type: " + std::string(text));
 }
@@ -231,8 +239,51 @@ int main(int argc, char** argv) {
     RuleBasedPolicy white_rule_policy;
     RandomPolicy white_random_policy;
 
-    PolicyBinding black_binding = make_binding(black_choice, black_rule_policy, black_random_policy);
-    PolicyBinding white_binding = make_binding(white_choice, white_rule_policy, white_random_policy);
+    // Optional MCTS / AlphaBeta instances (kept alive for closure captures)
+    std::unique_ptr<contrast_ai::MCTS> black_mcts_ptr;
+    std::unique_ptr<contrast_ai::MCTS> white_mcts_ptr;
+    std::unique_ptr<contrast_ai::AlphaBeta> black_ab_ptr;
+    std::unique_ptr<contrast_ai::AlphaBeta> white_ab_ptr;
+
+    const std::string weights_path = "ai/bin/ntuple_weights_vs_rulebased_swap.bin.100000";
+
+    PolicyBinding black_binding;
+    if (black_choice == PolicyChoice::MCTS) {
+        black_mcts_ptr = std::make_unique<contrast_ai::MCTS>();
+        black_mcts_ptr->load_network(weights_path);
+        black_binding.name = "MCTS";
+        black_binding.pick = [m = black_mcts_ptr.get()](const GameState& state) {
+            return m->search(state, 400, 0);
+        };
+    } else if (black_choice == PolicyChoice::AlphaBeta) {
+        black_ab_ptr = std::make_unique<contrast_ai::AlphaBeta>();
+        black_ab_ptr->load_network(weights_path);
+        black_binding.name = "AlphaBeta";
+        black_binding.pick = [m = black_ab_ptr.get()](const GameState& state) {
+            return m->search(state, 3, 0);
+        };
+    } else {
+        black_binding = make_binding(black_choice, black_rule_policy, black_random_policy);
+    }
+
+    PolicyBinding white_binding;
+    if (white_choice == PolicyChoice::MCTS) {
+        white_mcts_ptr = std::make_unique<contrast_ai::MCTS>();
+        white_mcts_ptr->load_network(weights_path);
+        white_binding.name = "MCTS";
+        white_binding.pick = [m = white_mcts_ptr.get()](const GameState& state) {
+            return m->search(state, 400, 0);
+        };
+    } else if (white_choice == PolicyChoice::AlphaBeta) {
+        white_ab_ptr = std::make_unique<contrast_ai::AlphaBeta>();
+        white_ab_ptr->load_network(weights_path);
+        white_binding.name = "AlphaBeta";
+        white_binding.pick = [m = white_ab_ptr.get()](const GameState& state) {
+            return m->search(state, 3, 0);
+        };
+    } else {
+        white_binding = make_binding(white_choice, white_rule_policy, white_random_policy);
+    }
 
     run_match_series(black_binding, white_binding, num_games);
     return 0;

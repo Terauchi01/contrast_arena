@@ -30,7 +30,10 @@ struct MCTSNode {
   
   float ucb1(float exploration_constant = 1.414f) const {
     if (visits == 0) return std::numeric_limits<float>::infinity();
-    float exploitation = total_value / visits;
+    // total_value is stored from this node's viewpoint; when selecting
+    // among children we need exploitation from the parent's viewpoint,
+    // therefore negate the child's average here.
+    float exploitation = - (total_value / visits);
     float exploration = exploration_constant * std::sqrt(std::log(parent->visits) / visits);
     return exploitation + exploration;
   }
@@ -49,7 +52,9 @@ public:
   explicit MCTS(const std::string& ntuple_weights_file);
   
   // 探索を実行して最良手を返す
-  contrast::Move search(const contrast::GameState& s, int iterations=1000);
+  // If time_ms > 0, search will stop after time_ms milliseconds (overrides/limits iterations).
+  // If time_ms == 0 and environment variable CONTRAST_MOVE_TIME is set (seconds), it will be used.
+  contrast::Move search(const contrast::GameState& s, int iterations=1000, int time_ms=0);
   
   // N-tupleネットワークを設定
   void set_network(const NTupleNetwork& network);

@@ -36,8 +36,27 @@
 
 namespace {
 
-constexpr int kServerPort = 8765;
+constexpr int kDefaultServerPort = 8765;
 constexpr char kServerHost[] = "127.0.0.1";
+
+int parse_port_env(const char* value, int fallback) {
+    if (!value) {
+        return fallback;
+    }
+    try {
+        const int port = std::stoi(value);
+        if (port < 1 || port > 65535) {
+            return fallback;
+        }
+        return port;
+    } catch (...) {
+        return fallback;
+    }
+}
+
+int resolve_server_port() {
+    return parse_port_env(std::getenv("CONTRAST_SERVER_PORT"), kDefaultServerPort);
+}
 
 std::optional<std::string> recv_line(int socket, std::string& buffer) {
     for (;;) {
@@ -213,9 +232,13 @@ class NTupleBigAdapter final : public PolicyAdapter {
         // Load weights from the trained file
         const std::string weights_path = "ai/bin/ntuple_weights_vs_rulebased_swap.bin.100000";
         if (!policy_.load(weights_path)) {
-            std::cerr << "[NTuple] Warning: Failed to load weights from " << weights_path << std::endl;
+            if (!std::getenv("CONTRAST_SILENT")) {
+                std::cerr << "[NTuple] Warning: Failed to load weights from " << weights_path << std::endl;
+            }
         } else {
-            std::cout << "[NTuple] Loaded weights from " << weights_path << std::endl;
+            if (!std::getenv("CONTRAST_SILENT")) {
+                std::cout << "[NTuple] Loaded weights from " << weights_path << std::endl;
+            }
         }
     }
     contrast::Move pick(const contrast::GameState& state) override { return policy_.pick(state); }
@@ -233,7 +256,9 @@ class AlphaBetaAdapter final : public PolicyAdapter {
         alphabeta_.set_verbose(false);
         alphabeta_.set_use_transposition_table(true);
         alphabeta_.set_use_move_ordering(true);
-        std::cout << "[AlphaBeta] Loaded NTuple weights, depth=" << depth_ << std::endl;
+        if (!std::getenv("CONTRAST_SILENT")) {
+            std::cout << "[AlphaBeta] Loaded NTuple weights, depth=" << depth_ << std::endl;
+        }
     }
     contrast::Move pick(const contrast::GameState& state) override {
         return alphabeta_.search(state, depth_, -1);
@@ -252,7 +277,9 @@ class MCTSAdapter final : public PolicyAdapter {
         mcts_.load_network(weights_path);
         mcts_.set_verbose(false);  // 本番用
         mcts_.set_exploration_constant(1.414f);
-        std::cout << "[MCTS] Loaded NTuple weights, iterations=" << iterations_ << std::endl;
+        if (!std::getenv("CONTRAST_SILENT")) {
+            std::cout << "[MCTS] Loaded NTuple weights, iterations=" << iterations_ << std::endl;
+        }
     }
     contrast::Move pick(const contrast::GameState& state) override {
         return mcts_.search(state, iterations_);
@@ -400,7 +427,9 @@ class ContrastClient {
                 return 1;
             }
             auto_player_ = std::move(requested);
-            std::cout << "[AUTO] Enabled " << auto_player_->model_name() << " policy" << std::endl;
+            if (!std::getenv("CONTRAST_SILENT")) {
+                std::cout << "[AUTO] Enabled " << auto_player_->model_name() << " policy" << std::endl;
+            }
         }
         std::thread reader(&ContrastClient::reader_loop, this);
         std::thread input;
@@ -428,9 +457,10 @@ class ContrastClient {
             std::cerr << "socket() failed" << std::endl;
             return false;
         }
+        const int server_port = resolve_server_port();
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(kServerPort);
+        addr.sin_port = htons(server_port);
         if (::inet_pton(AF_INET, kServerHost, &addr.sin_addr) <= 0) {
             std::cerr << "inet_pton failed" << std::endl;
             return false;
@@ -439,7 +469,7 @@ class ContrastClient {
             std::cerr << "connect() failed: " << std::strerror(errno) << std::endl;
             return false;
         }
-        std::cout << "Connected to " << kServerHost << ':' << kServerPort << std::endl;
+        std::cout << "Connected to " << kServerHost << ':' << server_port << std::endl;
         return true;
     }
 
@@ -450,7 +480,12 @@ class ContrastClient {
         const std::string role = desired_role_.empty() ? "-" : desired_role_;
         const std::string name = nickname_.empty() ? "-" : nickname_;
         const std::string model = model_arg_.empty() ? "-" : model_arg_;
-        safe_send("ROLE " + role + ' ' + name + ' ' + model + "\n");
+        std::string payload = "ROLE " + role + ' ' + name + ' ' + model;
+        if (num_games_ > 1) {
+            payload += " multi";
+        }
+        payload += "\n";
+        safe_send(payload);
     }
 
     void reader_loop() {

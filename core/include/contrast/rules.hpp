@@ -11,6 +11,7 @@ namespace Rules {
   void legal_moves(const GameState& s, MoveList& out);
   bool is_win(const GameState& s, Player p);
   bool is_loss(const GameState& s, Player p);
+  bool is_draw(const GameState& s);
 }
 
 } // namespace contrast

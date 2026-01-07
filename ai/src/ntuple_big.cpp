@@ -8,8 +8,12 @@
 #include <fstream>
 #include <iostream>
 #include <chrono>
+#include <mutex>
 
 namespace contrast_ai {
+
+// forward declaration for logging helper (in-namespace)
+static void __ntuple_log_sample(float v);
 
 // ============================================================================
 // NTuple implementation
@@ -255,6 +259,12 @@ NTupleNetwork::NTupleNetwork() {
   std::cout << "  Memory: " << actual_memory_mb << " MB (" 
             << actual_memory_gb << " GB)\n";
   std::cout << "========================================\n\n";
+
+  // If running in silent mode, avoid verbose allocation messages
+  if (std::getenv("CONTRAST_SILENT")) {
+    // Do not print further allocation summary
+    return;
+  }
 }
 
 // Copy constructor for fast in-memory copying
@@ -374,20 +384,22 @@ void NTupleNetwork::init_tuples() {
   std::cout << "========================================\n";
   std::cout << "N-tuple Network Configuration\n";
   std::cout << "========================================\n";
-  std::cout << "Encoding: SEPARATE (Piece + Tile + Hand)\n";
-  std::cout << "----------------------------------------\n";
-  std::cout << "Piece patterns: " << tuples_.size() << "\n";
-  std::cout << "  Alphabet: 3 (Empty/My/Opp)\n";
-  std::cout << "  States/pattern: " << total_piece_states << "\n";
-  std::cout << "  Memory: " << piece_memory << " MB\n";
-  std::cout << "Tile patterns: " << tile_tuples_.size() << "\n";
-  std::cout << "  Alphabet: 3 (None/Black/Gray)\n";
-  std::cout << "  States/pattern: " << total_tile_states << "\n";
-  std::cout << "  Memory: " << tile_memory << " MB\n";
-  std::cout << "Hand table: 8 states (" << hand_memory << " KB)\n";
-  std::cout << "----------------------------------------\n";
-  std::cout << "Total memory: " << (piece_memory + tile_memory) << " MB\n";
-  std::cout << "========================================\n";
+  if (!std::getenv("CONTRAST_SILENT")) {
+    std::cout << "Encoding: SEPARATE (Piece + Tile + Hand)\n";
+    std::cout << "----------------------------------------\n";
+    std::cout << "Piece patterns: " << tuples_.size() << "\n";
+    std::cout << "  Alphabet: 3 (Empty/My/Opp)\n";
+    std::cout << "  States/pattern: " << total_piece_states << "\n";
+    std::cout << "  Memory: " << piece_memory << " MB\n";
+    std::cout << "Tile patterns: " << tile_tuples_.size() << "\n";
+    std::cout << "  Alphabet: 3 (None/Black/Gray)\n";
+    std::cout << "  States/pattern: " << total_tile_states << "\n";
+    std::cout << "  Memory: " << tile_memory << " MB\n";
+    std::cout << "Hand table: 8 states (" << hand_memory << " KB)\n";
+    std::cout << "----------------------------------------\n";
+    std::cout << "Total memory: " << (piece_memory + tile_memory) << " MB\n";
+    std::cout << "========================================\n";
+  }
   
 #else
   // 部分結合版：駒×タイルを結合
@@ -397,7 +409,8 @@ void NTupleNetwork::init_tuples() {
   std::cout << "========================================\n";
   std::cout << "N-tuple Network Configuration\n";
   std::cout << "========================================\n";
-  std::cout << "Encoding: COMBINED (Piece×Tile + Hand)\n";
+  if (!std::getenv("CONTRAST_SILENT")) {
+    std::cout << "Encoding: COMBINED (Piece×Tile + Hand)\n";
   std::cout << "----------------------------------------\n";
   std::cout << "Piece×Tile patterns: " << tuples_.size() << "\n";
   std::cout << "  Alphabet: 9 (3 pieces × 3 tiles)\n";
@@ -406,7 +419,8 @@ void NTupleNetwork::init_tuples() {
   std::cout << "Hand table: 8 states (" << hand_memory << " KB)\n";
   std::cout << "----------------------------------------\n";
   std::cout << "Total memory: " << piece_memory << " GB\n";
-  std::cout << "========================================\n";
+    std::cout << "========================================\n";
+  }
 #endif
 }
 
@@ -507,7 +521,19 @@ float NTupleNetwork::evaluate(const contrast::GameState& state) const {
   int h_idx = hand_index(inv.black, inv.gray);
   value += hand_weights_[h_idx];
   
+  // Log sample for offline analysis
+  __ntuple_log_sample(value);
   return value;
+}
+
+// Instrumentation: append evaluation samples to a temp file for offline analysis
+static void __ntuple_log_sample(float v) {
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lk(mtx);
+  std::ofstream f("/tmp/ntuple_eval_samples.txt", std::ios::app);
+  if (f) {
+    f << v << "\n";
+  }
 }
 
 /**

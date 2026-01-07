@@ -25,7 +25,9 @@ void MCTS::set_network(const NTupleNetwork& network) {
 
 void MCTS::load_network(const std::string& weights_file) {
   network_.load(weights_file);
-  std::cerr << "[MCTS] Network loaded successfully" << std::endl;
+  if (!std::getenv("CONTRAST_SILENT")) {
+    std::cerr << "[MCTS] Network loaded successfully" << std::endl;
+  }
 }
 
 std::vector<Move> MCTS::get_legal_moves(const GameState& state) const {
@@ -151,35 +153,85 @@ void MCTS::backpropagate(MCTSNode* node, float value) {
   }
 }
 
-Move MCTS::search(const GameState& s, int iterations) {
-  if (verbose_) {
-    std::cerr << "[MCTS] Starting search with " << iterations << " iterations..." << std::endl;
+Move MCTS::search(const GameState& s, int iterations, int time_ms) {
+  // Determine effective time limit (ms). If time_ms==0, allow env var CONTRAST_MOVE_TIME (seconds).
+  int effective_time_ms = time_ms;
+  if (effective_time_ms <= 0) {
+    const char* env = std::getenv("CONTRAST_MOVE_TIME");
+    if (env) {
+      double secs = std::atof(env);
+      if (secs > 0.0) effective_time_ms = static_cast<int>(secs * 1000.0);
+    }
   }
-  
+
+  if (verbose_) {
+    if (effective_time_ms > 0) {
+      std::cerr << "[MCTS] Starting search with time limit " << effective_time_ms << " ms" << std::endl;
+    } else {
+      std::cerr << "[MCTS] Starting search with " << iterations << " iterations..." << std::endl;
+    }
+  }
+
   // ルートノード作成
   auto root = std::make_unique<MCTSNode>(s, Move{0, 0}, nullptr);
-  
-  // MCTS反復
-  for (int i = 0; i < iterations; ++i) {
-    // 1. Selection
-    MCTSNode* node = select(root.get());
-    
-    // 2. Expansion
-    if (node->visits > 0 && !node->is_terminal) {
-      expand(node);
-      if (!node->children.empty()) {
-        node = node->children[0].get();
+
+  // MCTS反復（時間制限があればそれを優先）
+  if (effective_time_ms > 0) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto deadline = start_time + std::chrono::milliseconds(effective_time_ms);
+
+    int i = 0;
+    while ((iterations <= 0 || i < iterations) && std::chrono::steady_clock::now() < deadline) {
+      // 1. Selection
+      MCTSNode* node = select(root.get());
+
+      // 2. Expansion
+      if (node->visits > 0 && !node->is_terminal) {
+        expand(node);
+        if (!node->children.empty()) {
+          std::uniform_int_distribution<size_t> dist(0, node->children.size() - 1);
+          size_t idx = dist(rng_);
+          node = node->children[idx].get();
+        }
+      }
+
+      // 3. Simulation
+      float value = simulate(node);
+
+      // 4. Backpropagation
+      backpropagate(node, value);
+
+      ++i;
+      if (verbose_ && (i) % 100 == 0) {
+        std::cerr << "[MCTS] Iteration " << i << " (time-limited)" << std::endl;
       }
     }
-    
-    // 3. Simulation
-    float value = simulate(node);
-    
-    // 4. Backpropagation
-    backpropagate(node, value);
-    
-    if (verbose_ && (i + 1) % 100 == 0) {
-      std::cerr << "[MCTS] Iteration " << (i + 1) << "/" << iterations << std::endl;
+  } else {
+    // 回数指定の場合の既存ループ
+    for (int i = 0; i < iterations; ++i) {
+      // 1. Selection
+      MCTSNode* node = select(root.get());
+
+      // 2. Expansion
+      if (node->visits > 0 && !node->is_terminal) {
+        expand(node);
+        if (!node->children.empty()) {
+          // Choose a child at random after expansion to avoid deterministic bias
+          std::uniform_int_distribution<size_t> dist(0, node->children.size() - 1);
+          size_t idx = dist(rng_);
+          node = node->children[idx].get();
+        }
+      }
+
+      // 3. Simulation
+      float value = simulate(node);
+
+      // 4. Backpropagation
+      backpropagate(node, value);
+
+      if (verbose_ && (i + 1) % 100 == 0) {
+        std::cerr << "[MCTS] Iteration " << (i + 1) << "/" << iterations << std::endl;
+      }
     }
   }
   
@@ -204,7 +256,7 @@ Move MCTS::search(const GameState& s, int iterations) {
   
   if (verbose_) {
     std::cerr << "[MCTS] Best move: visits=" << best_visits 
-              << ", avg_value=" << (best_child ? best_child->average_value() : 0.0f) 
+              << ", avg_value=" << (best_child ? -best_child->average_value() : 0.0f) 
               << std::endl;
   }
   

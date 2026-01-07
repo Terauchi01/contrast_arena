@@ -3,6 +3,8 @@
 
 namespace contrast {
 
+static constexpr int kRepetitionDrawCount = 4;
+
 // Direction vectors as fixed arrays
 static constexpr int ORTHO[4][2] = {{1,0},{-1,0},{0,1},{0,-1}};
 static constexpr int DIAG[4][2] = {{1,1},{1,-1},{-1,1},{-1,-1}};
@@ -81,7 +83,14 @@ void Rules::legal_moves(const GameState& s, MoveList& out) {
     if (inv.black > 0) {
       for (int y = 0; y < b.height(); ++y) {
         for (int x = 0; x < b.width(); ++x) {
-          if (b.at(x,y).occupant == Player::None && b.at(x,y).tile == TileType::None) {
+          // Allow placing a tile on any cell that will be empty after the base move.
+          // That includes cells that are currently empty, or the origin square of the move
+          // (which becomes empty after the piece moves). Never allow placing on the
+          // destination (the moved piece occupies it after the move).
+          const bool tile_empty = (b.at(x,y).tile == TileType::None);
+          const bool will_be_empty = (b.at(x,y).occupant == Player::None) || (x == base.sx && y == base.sy);
+          const bool is_destination = (x == base.dx && y == base.dy);
+          if (tile_empty && will_be_empty && !is_destination) {
             Move m = base; 
             m.place_tile = true; 
             m.tx = x; 
@@ -97,7 +106,10 @@ void Rules::legal_moves(const GameState& s, MoveList& out) {
     if (inv.gray > 0) {
       for (int y = 0; y < b.height(); ++y) {
         for (int x = 0; x < b.width(); ++x) {
-          if (b.at(x,y).occupant == Player::None && b.at(x,y).tile == TileType::None) {
+          const bool tile_empty = (b.at(x,y).tile == TileType::None);
+          const bool will_be_empty = (b.at(x,y).occupant == Player::None) || (x == base.sx && y == base.sy);
+          const bool is_destination = (x == base.dx && y == base.dy);
+          if (tile_empty && will_be_empty && !is_destination) {
             Move m = base;
             m.place_tile = true;
             m.tx = x;
@@ -125,6 +137,15 @@ bool Rules::is_loss(const GameState& s, Player p) {
   MoveList moves;
   legal_moves(s, moves);
   return moves.empty();
+}
+
+bool Rules::is_draw(const GameState& s) {
+  const uint64_t h = s.compute_hash();
+  const auto it = s.history_.find(h);
+  if (it == s.history_.end()) {
+    return false;
+  }
+  return it->second >= kRepetitionDrawCount;
 }
 
 } // namespace contrast

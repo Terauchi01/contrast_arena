@@ -22,6 +22,7 @@ class MCTS:
         self,
         network: torch.nn.Module,
         device: torch.device,
+        inference_server=None,
         alpha=None,
         c_puct=None,
         epsilon=None,
@@ -45,6 +46,7 @@ class MCTS:
             epsilon = mcts_config.DIRICHLET_EPSILON
         self.network = network
         self.device = device
+        self.inference_server = inference_server
         self.alpha = alpha
         self.c_puct = c_puct
         self.eps = epsilon
@@ -225,12 +227,18 @@ class MCTS:
 
         # encode_state内でP2なら自動的に反転される
         input_tensor = (
-            torch.from_numpy(game.encode_state()).unsqueeze(0).to(self.device)
+            torch.from_numpy(game.encode_state()).unsqueeze(0)
         )
 
-        self.network.eval()
-        with torch.no_grad():
-            move_logits, tile_logits, value = self.network(input_tensor)
+        # Use inference server if provided (batching), otherwise call network directly
+        if self.inference_server is not None:
+            fut = self.inference_server.submit(input_tensor)
+            move_logits, tile_logits, value = fut.result()
+        else:
+            input_tensor = input_tensor.to(self.device)
+            self.network.eval()
+            with torch.no_grad():
+                move_logits, tile_logits, value = self.network(input_tensor)
 
         value = value.item()
 

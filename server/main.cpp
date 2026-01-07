@@ -29,13 +29,44 @@
 
 namespace {
 
-constexpr int kServerPort = 8765;
+constexpr int kDefaultServerPort = 8765;
 constexpr int kBacklog = 8;
+
+int parse_port_string(const std::string& value, int fallback) {
+    try {
+        const int port = std::stoi(value);
+        if (port < 1 || port > 65535) {
+            return fallback;
+        }
+        return port;
+    } catch (...) {
+        return fallback;
+    }
+}
+
+int resolve_server_port(int argc, char** argv) {
+    // Priority: CLI flag --port / --port=... > env CONTRAST_SERVER_PORT > default
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--port" && i + 1 < argc) {
+            return parse_port_string(argv[i + 1], kDefaultServerPort);
+        }
+        const std::string prefix = "--port=";
+        if (arg.rfind(prefix, 0) == 0) {
+            return parse_port_string(arg.substr(prefix.size()), kDefaultServerPort);
+        }
+    }
+    if (const char* env = std::getenv("CONTRAST_SERVER_PORT")) {
+        return parse_port_string(env, kDefaultServerPort);
+    }
+    return kDefaultServerPort;
+}
 
 struct GameStats {
     int total_games{0};
     int x_wins{0};
     int o_wins{0};
+    int draws{0};
     std::string x_player_name;
     std::string o_player_name;
 };
@@ -46,6 +77,7 @@ struct ClientSession {
     std::string name{"anon"};
     bool active{true};
     bool ready{false};
+    bool multi_game{false}; // 連戦モード
 };
 
 std::mutex g_clients_mutex;
@@ -56,6 +88,11 @@ std::string g_last_move;
 std::string g_status = "ongoing";
 GameStats g_stats;
 std::ofstream g_log_file;
+
+bool should_log_board() {
+    const char* flag = std::getenv("CONTRAST_SERVER_LOG_BOARD");
+    return flag && std::string(flag) == "1";
+}
 
 char player_to_symbol(contrast::Player player) {
     switch (player) {
@@ -130,6 +167,16 @@ contrast::Move convert_move(const protocol::Move& move) {
     return core_move;
 }
 
+std::string format_core_move(const contrast::Move& m) {
+    std::string origin = xy_to_coord(m.sx, m.sy);
+    std::string target = xy_to_coord(m.dx, m.dy);
+    std::string tile_str = "-1";
+    if (m.place_tile) {
+        tile_str = xy_to_coord(m.tx, m.ty) + tile_to_char(m.tile);
+    }
+    return origin + "," + target + " " + tile_str;
+}
+
 bool moves_equal(const contrast::Move& a, const contrast::Move& b) {
     if (a.sx != b.sx || a.sy != b.sy || a.dx != b.dx || a.dy != b.dy) {
         return false;
@@ -179,6 +226,10 @@ void update_status(contrast::Player last_player) {
         g_status = std::string(1, player_to_symbol(last_player)) + "_win";
         return;
     }
+    if (contrast::Rules::is_draw(g_state)) {
+        g_status = "draw";
+        return;
+    }
     g_status = "ongoing";
 }
 
@@ -192,6 +243,33 @@ void reset_game() {
     }
 }
 
+void log_snapshot_details(const protocol::StateSnapshot& snapshot, const std::string& prefix) {
+    std::ostringstream oss;
+    oss << prefix << " turn=" << snapshot.turn << " status=" << snapshot.status << " last_move=" << snapshot.last_move;
+    oss << " pieces:";
+    for (const auto& p : snapshot.pieces) {
+        oss << ' ' << p.first << ':' << p.second;
+    }
+    oss << " tiles:";
+    for (const auto& t : snapshot.tiles) {
+        oss << ' ' << t.first << ':' << t.second;
+    }
+    oss << " stock_b:";
+    for (const auto& sb : snapshot.stock_black) {
+        oss << ' ' << sb.first << ':' << sb.second;
+    }
+    oss << " stock_g:";
+    for (const auto& sg : snapshot.stock_gray) {
+        oss << ' ' << sg.first << ':' << sg.second;
+    }
+    std::string s = oss.str();
+    std::cerr << s << std::endl;
+    if (g_log_file.is_open()) {
+        g_log_file << s << std::endl;
+        g_log_file.flush();
+    }
+}
+
 void record_game_result(const std::string& winner) {
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     g_stats.total_games++;
@@ -199,6 +277,8 @@ void record_game_result(const std::string& winner) {
         g_stats.x_wins++;
     } else if (winner == "O") {
         g_stats.o_wins++;
+    } else {
+        g_stats.draws++;
     }
     
     // Update player names
@@ -222,7 +302,7 @@ void record_game_result(const std::string& winner) {
     
     std::cout << "\n=== Game " << g_stats.total_games << " finished ==="
               << "\nWinner: " << winner
-              << "\nScore: X=" << g_stats.x_wins << " O=" << g_stats.o_wins
+              << "\nScore: X=" << g_stats.x_wins << " O=" << g_stats.o_wins << " Draw=" << g_stats.draws
               << " (" << g_stats.x_player_name << " vs " << g_stats.o_player_name << ")"
               << "\n" << std::endl;
 }
@@ -357,6 +437,17 @@ bool role_in_use_locked(const std::string& role, const std::shared_ptr<ClientSes
     return false;
 }
 
+bool both_players_multi_game() {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    bool x_multi = false, o_multi = false;
+    for (const auto& client : g_clients) {
+        if (!client->active) continue;
+        if (client->role == "X") x_multi = client->multi_game;
+        if (client->role == "O") o_multi = client->multi_game;
+    }
+    return x_multi && o_multi;
+}
+
 void remove_client(const std::shared_ptr<ClientSession>& session) {
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     for (auto it = g_clients.begin(); it != g_clients.end(); ++it) {
@@ -384,7 +475,21 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
         send_error(session->socket, ex.what());
         return;
     }
+    // Convert to core move and log both protocol and core representations for debugging
+    contrast::Move desired = convert_move(move);
+    {
+        std::ostringstream oss;
+        oss << "[RECV_MOVE] from " << session->role << "(" << session->name << "): proto=\""
+            << protocol::format_move(move) << "\" core=\"" << format_core_move(desired) << "\"";
+        std::string s = oss.str();
+        std::cerr << s << std::endl;
+        if (g_log_file.is_open()) {
+            g_log_file << s << std::endl;
+            g_log_file.flush();
+        }
+    }
     protocol::StateSnapshot snapshot;
+    bool game_ended = false;
     {
         std::lock_guard<std::mutex> lock(g_game_mutex);
         if (player != g_state.current_player()) {
@@ -397,6 +502,27 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
         auto it = std::find_if(legal.begin(), legal.end(),
                                [&](const contrast::Move& candidate) { return moves_equal(candidate, desired); });
         if (it == legal.end()) {
+            // Log detailed info about the illegal move and available legal moves
+            std::ostringstream oss;
+            oss << "Illegal move received from " << session->role << "(" << session->name << "): "
+                << protocol::format_move(move) << ". Legal moves:";
+            for (const auto& lm : legal) {
+                oss << ' ' << format_core_move(lm);
+            }
+            std::string info = oss.str();
+            std::cerr << info << std::endl;
+            if (g_log_file.is_open()) {
+                g_log_file << info << std::endl;
+                g_log_file.flush();
+            }
+            // Also log the current snapshot for debugging
+            protocol::StateSnapshot cur_snapshot;
+            {
+                // Use the current game mutex to safely read state
+                std::lock_guard<std::mutex> lock(g_game_mutex);
+                cur_snapshot = build_snapshot();
+            }
+            log_snapshot_details(cur_snapshot, "[ILLEGAL_MOVE_SNAPSHOT]");
             send_error(session->socket, "Illegal move according to core rules");
             return;
         }
@@ -404,7 +530,6 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
         g_last_move = protocol::format_move(move);
         update_status(player);
         snapshot = build_snapshot();
-        
         // Record result if game ended
         if (g_status != "ongoing") {
             std::string winner;
@@ -412,14 +537,31 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
                 winner = "X";
             } else if (g_status == "O_win") {
                 winner = "O";
+            } else if (g_status == "draw") {
+                winner = "Draw";
             }
             if (!winner.empty()) {
                 record_game_result(winner);
             }
+            game_ended = true;
         }
     }
-    std::cout << "\n" << protocol::render_board(snapshot.pieces, snapshot.tiles) << "\n";
+    if (should_log_board()) {
+        std::cout << "\n" << protocol::render_board(snapshot.pieces, snapshot.tiles) << "\n";
+    }
     broadcast_state(snapshot);
+
+    // 連戦モードなら自動で次ゲームを開始
+    if (game_ended && both_players_multi_game()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300)); // クライアント側の受信猶予
+        {
+            std::lock_guard<std::mutex> lock(g_game_mutex);
+            reset_game();
+            protocol::StateSnapshot next_snapshot = build_snapshot();
+            log_snapshot_details(next_snapshot, "[AUTO_RESET_BROADCAST]");
+            broadcast_state(next_snapshot);
+        }
+    }
 }
 
 void handle_role(const std::shared_ptr<ClientSession>& session, const std::string& payload) {
@@ -427,6 +569,7 @@ void handle_role(const std::shared_ptr<ClientSession>& session, const std::strin
     std::string role_token;
     std::string name_token;
     std::string model_token;
+    std::string multi_token;
     if (!(iss >> role_token)) {
         send_error(session->socket, "ROLE requires a target role");
         return;
@@ -437,6 +580,12 @@ void handle_role(const std::shared_ptr<ClientSession>& session, const std::strin
     if (iss >> model_token) {
         // モデル名は現在サーバ側で利用しないが、クライアントとの整合性のため読み捨てておく
         (void)model_token;
+        // さらにmulti_game指定があれば受け取る
+        if (iss >> multi_token) {
+            if (multi_token == "multi" || multi_token == "連戦" || multi_token == "multi_game") {
+                session->multi_game = true;
+            }
+        }
     }
     std::string normalized = role_token;
     for (char& ch : normalized) {
@@ -466,7 +615,12 @@ void handle_role(const std::shared_ptr<ClientSession>& session, const std::strin
         if (name_token != "-") {
             session->name = name_token;
         }
+        // multi_gameはROLEコマンドで指定がなければfalseにリセット
+        if (multi_token.empty()) {
+            session->multi_game = false;
+        }
     }
+    // 両者がmulti_gameならtrue (ヘルパー関数はファイルレベルで定義されています)
     send_info(session->socket, "You are " + session->role + " (" + session->name + ")");
     // Send current game state after role assignment
     {
@@ -480,14 +634,19 @@ void handle_ready(const std::shared_ptr<ClientSession>& session) {
         send_error(session->socket, "Spectators cannot ready up");
         return;
     }
-    
+
+    // READY multi などでmulti_game指定を受け付ける
+    if (!session->name.empty()) {
+        // READYコマンドのpayloadをbufferから取得するにはclient_thread側の処理を修正する必要があるが、
+        // ここでは簡易的にmulti_game指定はROLE推奨とする
+    }
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         session->ready = true;
     }
-    
+
     send_info(session->socket, "Ready acknowledged");
-    
+
     // Check if all players are ready
     if (all_players_ready()) {
         std::cout << "Both players ready, starting new game..." << std::endl;
@@ -495,13 +654,14 @@ void handle_ready(const std::shared_ptr<ClientSession>& session) {
             std::lock_guard<std::mutex> lock(g_game_mutex);
             reset_game();
         }
-        
+
         // Broadcast new game state
         protocol::StateSnapshot snapshot;
         {
             std::lock_guard<std::mutex> lock(g_game_mutex);
             snapshot = build_snapshot();
         }
+        log_snapshot_details(snapshot, "[NEW_GAME_BROADCAST]");
         broadcast_state(snapshot);
     }
 }
@@ -531,7 +691,8 @@ void client_thread(std::shared_ptr<ClientSession> session) {
             } else if (*line == "GET_STATS") {
                 std::string stats_msg = "STATS games=" + std::to_string(g_stats.total_games) +
                                        " x_wins=" + std::to_string(g_stats.x_wins) +
-                                       " o_wins=" + std::to_string(g_stats.o_wins) + "\n";
+                                       " o_wins=" + std::to_string(g_stats.o_wins) +
+                                       " draws=" + std::to_string(g_stats.draws) + "\n";
                 send_all(session->socket, stats_msg);
             } else {
                 send_error(session->socket, "Unknown command: " + *line);
@@ -544,9 +705,41 @@ void client_thread(std::shared_ptr<ClientSession> session) {
     ::close(session->socket);
     remove_client(session);
     std::cout << "Client disconnected (" << session->role << ", " << session->name << ")" << std::endl;
+
+    // If all players have disconnected, reset the game so the next clients can start a fresh game
+    // without requiring an explicit READY handshake.
+    bool should_reset = false;
+    {
+        std::lock_guard<std::mutex> clients_lock(g_clients_mutex);
+        bool has_x = false;
+        bool has_o = false;
+        for (const auto& client : g_clients) {
+            if (!client->active) {
+                continue;
+            }
+            if (client->role == "X") {
+                has_x = true;
+            } else if (client->role == "O") {
+                has_o = true;
+            }
+        }
+
+        if (!has_x && !has_o) {
+            for (auto& client : g_clients) {
+                client->ready = false;
+            }
+            should_reset = true;
+        }
+    }
+    if (should_reset) {
+        std::lock_guard<std::mutex> game_lock(g_game_mutex);
+        g_state = contrast::GameState();
+        g_last_move.clear();
+        g_status = "ongoing";
+    }
 }
 
-int create_server_socket() {
+int create_server_socket(int port) {
     const int sock = ::socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         throw std::runtime_error("socket() failed");
@@ -556,7 +749,7 @@ int create_server_socket() {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(kServerPort);
+    addr.sin_port = htons(port);
     if (::bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
         ::close(sock);
         throw std::runtime_error("bind() failed");
@@ -593,7 +786,7 @@ void accept_loop(int server_sock) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::signal(SIGPIPE, SIG_IGN);
     
     // Open log file
@@ -608,8 +801,9 @@ int main() {
     }
     
     try {
-        const int server_sock = create_server_socket();
-        std::cout << "Server listening on port " << kServerPort << std::endl;
+        const int port = resolve_server_port(argc, argv);
+        const int server_sock = create_server_socket(port);
+        std::cout << "Server listening on port " << port << std::endl;
         accept_loop(server_sock);
         ::close(server_sock);
     } catch (const std::exception& ex) {
