@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <array>
 #include <cctype>
 #include <map>
@@ -75,6 +76,9 @@ struct Move {
     std::string origin;
     std::string target;
     TilePlacement tile;
+    // Optional id fields for idempotency: game identifier and monotonically increasing move id
+    uint64_t game_id{0};
+    uint64_t move_id{0};
 };
 
 struct StateSnapshot {
@@ -85,6 +89,7 @@ struct StateSnapshot {
     std::string last_move{};
     std::map<char, int> stock_black;
     std::map<char, int> stock_gray;
+    uint64_t game_id{0};
 };
 
 inline TilePlacement parse_tile(const std::string& text) {
@@ -119,7 +124,7 @@ inline Move parse_move(const std::string& text) {
         throw ProtocolError("Move must include space separating to/tile segments");
     }
     const std::string displacement = trimmed.substr(0, space_pos);
-    const std::string tile_part = trimmed.substr(space_pos + 1);
+    const std::string rest = trimmed.substr(space_pos + 1);
     const auto comma_pos = displacement.find(',');
     if (comma_pos == std::string::npos || displacement.find(',', comma_pos + 1) != std::string::npos) {
         throw ProtocolError("Move must include exactly one comma between origin and target");
@@ -127,7 +132,19 @@ inline Move parse_move(const std::string& text) {
     Move move;
     move.origin = normalize_coord(displacement.substr(0, comma_pos));
     move.target = normalize_coord(displacement.substr(comma_pos + 1));
-    move.tile = parse_tile(tile_part);
+    // rest may contain tile token followed by optional game_id and move_id
+    std::stringstream ss(rest);
+    std::string tile_token;
+    if (!(ss >> tile_token)) {
+        throw ProtocolError("Missing tile descriptor in move");
+    }
+    move.tile = parse_tile(tile_token);
+    uint64_t gid = 0;
+    uint64_t mid = 0;
+    if (ss >> gid) {
+        move.game_id = gid;
+        if (ss >> mid) move.move_id = mid;
+    }
     return move;
 }
 
@@ -138,6 +155,9 @@ inline std::string format_move(const Move& move) {
         oss << "-1";
     } else {
         oss << move.tile.coord << move.tile.color;
+    }
+    if (move.game_id != 0 || move.move_id != 0) {
+        oss << ' ' << move.game_id << ' ' << move.move_id;
     }
     return oss.str();
 }
@@ -254,6 +274,7 @@ inline std::map<char, int> parse_counts(const std::string& text) {
 inline std::string build_state_message(const StateSnapshot& snapshot) {
     std::ostringstream oss;
     oss << "STATE\n";
+    oss << "game_id=" << snapshot.game_id << "\n";
     oss << "turn=" << snapshot.turn << "\n";
     oss << "status=" << snapshot.status << "\n";
     oss << "last=" << snapshot.last_move << "\n";
@@ -274,7 +295,9 @@ inline StateSnapshot parse_state_block(const std::vector<std::string>& lines) {
         }
         const std::string key = line.substr(0, eq);
         const std::string value = line.substr(eq + 1);
-        if (key == "turn" && !value.empty()) {
+        if (key == "game_id") {
+            snapshot.game_id = static_cast<uint64_t>(std::stoull(value));
+        } else if (key == "turn" && !value.empty()) {
             snapshot.turn = value.front();
         } else if (key == "status") {
             snapshot.status = value;

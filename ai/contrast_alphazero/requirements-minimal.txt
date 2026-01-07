@@ -1,0 +1,4 @@
+# Minimal requirements for quick setup
+# Pin numpy to the project's known version; leave torch unpinned so user can choose appropriate CUDA/CPU build
+numpy==2.3.4
+torch

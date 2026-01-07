@@ -88,6 +88,9 @@ std::string g_last_move;
 std::string g_status = "ongoing";
 GameStats g_stats;
 std::ofstream g_log_file;
+uint64_t g_game_id = 1;
+// Track last accepted move_id per role to ignore duplicates/old moves
+std::map<std::string, uint64_t> g_last_received_move_id{{"X", 0}, {"O", 0}};
 
 bool should_log_board() {
     const char* flag = std::getenv("CONTRAST_SERVER_LOG_BOARD");
@@ -210,8 +213,9 @@ protocol::StateSnapshot build_snapshot() {
     snapshot.last_move = g_last_move;
     const auto& inv_black = g_state.inventory(contrast::Player::Black);
     const auto& inv_white = g_state.inventory(contrast::Player::White);
-    snapshot.stock_black = {{'X', inv_black.black}, {'O', inv_white.black}};
-    snapshot.stock_gray = {{'X', inv_black.gray}, {'O', inv_white.gray}};
+    snapshot.stock_black = std::map<char,int>{{'X', inv_black.black}, {'O', inv_white.black}};
+    snapshot.stock_gray = std::map<char,int>{{'X', inv_black.gray}, {'O', inv_white.gray}};
+    snapshot.game_id = g_game_id;
     return snapshot;
 }
 
@@ -237,6 +241,11 @@ void reset_game() {
     g_state = contrast::GameState();
     g_last_move.clear();
     g_status = "ongoing";
+    // Advance logical game id so clients sending old game_id are rejected
+    ++g_game_id;
+    // Reset last received move ids so new game starts fresh
+    g_last_received_move_id["X"] = 0;
+    g_last_received_move_id["O"] = 0;
     std::lock_guard<std::mutex> lock(g_clients_mutex);
     for (auto& client : g_clients) {
         client->ready = false;
@@ -488,6 +497,27 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
             g_log_file.flush();
         }
     }
+    // If client provided a game_id, verify it matches current server game id.
+    // If mismatched, resend authoritative STATE so client can resync.
+    {
+        protocol::StateSnapshot cur_snapshot;
+        {
+            std::lock_guard<std::mutex> lock(g_game_mutex);
+            if (move.game_id != 0 && move.game_id != g_game_id) {
+                cur_snapshot = build_snapshot();
+            }
+        }
+        if (cur_snapshot.game_id != 0) {
+            log_snapshot_details(cur_snapshot, "[STALE_GAME_ID_REJECT]");
+            send_error(session->socket, "Stale or mismatched game_id; resyncing state");
+            try {
+                broadcast_state(cur_snapshot);
+            } catch (...) {
+                std::cerr << "Failed to broadcast STATE for stale game_id to clients" << std::endl;
+            }
+            return;
+        }
+    }
     protocol::StateSnapshot snapshot;
     bool game_ended = false;
     {
@@ -496,16 +526,63 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
             send_error(session->socket, std::string("It is ") + player_to_symbol(g_state.current_player()) + "'s turn");
             return;
         }
+        // If client provided a move_id, ignore duplicates or older move_ids for this role
+            if (move.move_id != 0) {
+                const uint64_t last = g_last_received_move_id[session->role];
+                if (move.move_id <= last) {
+                    // Duplicate or stale move_id: broadcast current authoritative state
+                    protocol::StateSnapshot cur_snapshot = build_snapshot();
+                    log_snapshot_details(cur_snapshot, "[DUPLICATE_OR_OLD_MOVE]");
+                    send_error(session->socket, "Duplicate or old move_id; resyncing state");
+                    try {
+                        broadcast_state(cur_snapshot);
+                    } catch (...) {
+                        std::cerr << "Failed to broadcast STATE for duplicate/old move" << std::endl;
+                    }
+                    return;
+                }
+            }
         contrast::Move desired = convert_move(move);
         contrast::MoveList legal;
         contrast::Rules::legal_moves(g_state, legal);
         auto it = std::find_if(legal.begin(), legal.end(),
                                [&](const contrast::Move& candidate) { return moves_equal(candidate, desired); });
         if (it == legal.end()) {
-            // Log detailed info about the illegal move and available legal moves
+            // Determine a human-readable reason why the move is illegal (best-effort)
+            std::string reason;
+            const contrast::Board& board = g_state.board();
+            // Bounds checks
+            if (!board.in_bounds(desired.sx, desired.sy) || !board.in_bounds(desired.dx, desired.dy)) {
+                reason = "Origin or target coordinate out of bounds";
+            } else if (board.at(desired.sx, desired.sy).occupant != player) {
+                const auto occ = board.at(desired.sx, desired.sy).occupant;
+                reason = std::string("Origin does not contain player's piece (has ") + (occ == contrast::Player::None ? "none" : std::string(1, player_to_symbol(occ))) + ")";
+            } else if (board.at(desired.dx, desired.dy).occupant != contrast::Player::None) {
+                const auto occ = board.at(desired.dx, desired.dy).occupant;
+                reason = std::string("Destination occupied by ") + std::string(1, player_to_symbol(occ));
+            } else if (desired.place_tile) {
+                if (!board.in_bounds(desired.tx, desired.ty)) {
+                    reason = "Tile placement coordinate out of bounds";
+                } else if (board.at(desired.tx, desired.ty).tile != contrast::TileType::None) {
+                    reason = std::string("Tile target ") + xy_to_coord(desired.tx, desired.ty) + " already has a tile";
+                } else {
+                    const auto inv = g_state.inventory(player);
+                    if (desired.tile == contrast::TileType::Black && inv.black <= 0) {
+                        reason = "No black tiles available in inventory";
+                    } else if (desired.tile == contrast::TileType::Gray && inv.gray <= 0) {
+                        reason = "No gray tiles available in inventory";
+                    }
+                }
+            }
+
+            if (reason.empty()) {
+                reason = "Move not present in generated legal moves";
+            }
+
+            // Log detailed info about the illegal move, the reason, and available legal moves
             std::ostringstream oss;
             oss << "Illegal move received from " << session->role << "(" << session->name << "): "
-                << protocol::format_move(move) << ". Legal moves:";
+                << protocol::format_move(move) << ". Reason: " << reason << ". Legal moves:";
             for (const auto& lm : legal) {
                 oss << ' ' << format_core_move(lm);
             }
@@ -515,19 +592,25 @@ void handle_move(const std::shared_ptr<ClientSession>& session, const std::strin
                 g_log_file << info << std::endl;
                 g_log_file.flush();
             }
-            // Also log the current snapshot for debugging
-            protocol::StateSnapshot cur_snapshot;
-            {
-                // Use the current game mutex to safely read state
-                std::lock_guard<std::mutex> lock(g_game_mutex);
-                cur_snapshot = build_snapshot();
-            }
+
+            // Also log the current snapshot for debugging and resend it to the sender
+            protocol::StateSnapshot cur_snapshot = build_snapshot();
             log_snapshot_details(cur_snapshot, "[ILLEGAL_MOVE_SNAPSHOT]");
-            send_error(session->socket, "Illegal move according to core rules");
+            // Notify client of illegal move and include the reason so client logs are actionable
+            send_error(session->socket, std::string("Illegal move: ") + reason + "; resyncing state");
+            try {
+                broadcast_state(cur_snapshot);
+            } catch (...) {
+                std::cerr << "Failed to broadcast STATE after illegal move" << std::endl;
+            }
             return;
         }
         g_state.apply_move(*it);
         g_last_move = protocol::format_move(move);
+        // Mark this move_id as accepted for this role so duplicates are ignored later
+        if (move.move_id != 0) {
+            g_last_received_move_id[session->role] = move.move_id;
+        }
         update_status(player);
         snapshot = build_snapshot();
         // Record result if game ended

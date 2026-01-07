@@ -19,6 +19,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <cstdint>
 
 #include "../common/protocol.hpp"
 #include "contrast/board.hpp"
@@ -293,7 +294,7 @@ class MCTSAdapter final : public PolicyAdapter {
 class AutoPlayer {
    public:
     static std::unique_ptr<AutoPlayer> Create(const std::string& model_name,
-                                              std::function<void(const std::string&)> sender) {
+                                              std::function<void(const protocol::Move&)> sender) {
         const std::string normalized = protocol::to_lower(model_name);
         if (normalized.empty() || normalized == "-" || normalized == "manual") {
             return nullptr;
@@ -359,6 +360,22 @@ class AutoPlayer {
         awaiting_turn_resolution_ = false;
     }
 
+    // Called when a fresh STATE is received from server; allows retry if it's our turn
+    void on_state_received(const protocol::StateSnapshot& snapshot) {
+        if (role_symbol_ == '?') return;
+        const char turn_symbol = static_cast<char>(std::toupper(static_cast<unsigned char>(snapshot.turn)));
+        if (turn_symbol == role_symbol_) {
+            awaiting_turn_resolution_ = false;
+        }
+    }
+
+    // Notify auto-player that its last sent move was rejected
+    void on_error_received() {
+        if (last_sent_text_.empty()) return;
+        suppress_until_next_state_ = true;
+        last_rejected_text_ = last_sent_text_;
+    }
+
     void handle_snapshot(const protocol::StateSnapshot& snapshot) {
         if (!policy_ || role_symbol_ == '?') {
             awaiting_turn_resolution_ = false;
@@ -377,30 +394,46 @@ class AutoPlayer {
         if (awaiting_turn_resolution_) {
             return;
         }
+        // If we recently had our last sent move rejected, don't immediately resend the same move
+        if (suppress_until_next_state_) {
+            // If server's authoritative last_move changed to something else, clear suppression
+            if (snapshot.last_move.rfind(last_rejected_text_, 0) != 0) {
+                suppress_until_next_state_ = false;
+                last_rejected_text_.clear();
+            } else {
+                return;
+            }
+        }
         const contrast::GameState state = snapshot_to_state(snapshot);
         const contrast::Move move = policy_->pick(state);
         if (move.sx < 0 || move.dx < 0) {
             return;
         }
-        const protocol::Move proto = convert_core_move(move);
+        protocol::Move proto = convert_core_move(move);
         const std::string text = protocol::format_move(proto);
         std::cout << "[AUTO] " << model_name_ << " plays " << text << '\n';
-        sender_("MOVE " + text + "\n");
+        // Caller (ContrastClient) will attach game_id/move_id when sending
+        sender_(proto);
         awaiting_turn_resolution_ = true;
+        last_sent_text_ = protocol::format_move(proto);
     }
 
     const std::string& model_name() const { return model_name_; }
 
    private:
     AutoPlayer(std::string model_name, std::unique_ptr<PolicyAdapter> policy,
-               std::function<void(const std::string&)> sender)
+               std::function<void(const protocol::Move&)> sender)
         : sender_(std::move(sender)), policy_(std::move(policy)), model_name_(std::move(model_name)) {}
 
-    std::function<void(const std::string&)> sender_;
+    std::function<void(const protocol::Move&)> sender_;
     std::unique_ptr<PolicyAdapter> policy_;
     std::string model_name_;
     char role_symbol_{'?'};
     bool awaiting_turn_resolution_{false};
+    // Track last sent move text and suppress immediate resend on rejection
+    std::string last_sent_text_;
+    std::string last_rejected_text_;
+    bool suppress_until_next_state_{false};
 };
 
 class ContrastClient {
@@ -419,8 +452,12 @@ class ContrastClient {
             return 1;
         }
         if (model_requested_) {
-            auto requested = AutoPlayer::Create(model_arg_, [this](const std::string& payload) {
-                safe_send(payload);
+            auto requested = AutoPlayer::Create(model_arg_, [this](const protocol::Move& m) {
+                protocol::Move mm = m;
+                mm.game_id = current_game_id_;
+                mm.move_id = next_move_id_++;
+                const std::string text = protocol::format_move(mm);
+                safe_send("MOVE " + text + "\n");
             });
             if (!requested) {
                 std::cerr << "Unable to initialize model '" << model_arg_ << "'" << std::endl;
@@ -513,8 +550,14 @@ class ContrastClient {
                 }
                 if (!block.empty()) {
                     protocol::StateSnapshot snapshot = protocol::parse_state_block(block);
-                    std::cout << "\n=== STATE ===\n";
-                    std::cout << protocol::render_board(snapshot.pieces, snapshot.tiles) << '\n';
+                    // Update client's notion of current game id and reset move counter on change
+                    if (snapshot.game_id != current_game_id_) {
+                        current_game_id_ = snapshot.game_id;
+                        next_move_id_ = 1;
+                    }
+                    // Board ASCII output commented out to reduce log noise
+                    // std::cout << "\n=== STATE ===\n";
+                    // std::cout << protocol::render_board(snapshot.pieces, snapshot.tiles) << '\n';
                     std::cout << "Turn: " << snapshot.turn << " | Status: " << snapshot.status
                               << " | Last move: " << snapshot.last_move << '\n';
                     auto stock_val = [](const std::map<char, int>& store, char player) {
@@ -554,7 +597,9 @@ class ContrastClient {
                     }
                     last_status_ = snapshot.status;
                     if (auto_player_) {
-                        auto_player_->handle_snapshot(snapshot);
+                                    // Allow auto player to reconsider after receiving authoritative STATE
+                                    auto_player_->on_state_received(snapshot);
+                                    auto_player_->handle_snapshot(snapshot);
                     }
                 }
                 continue;
@@ -565,6 +610,9 @@ class ContrastClient {
                 handle_info_line(payload);
             } else if (line->rfind("ERROR ", 0) == 0) {
                 std::cout << "[ERROR] " << line->substr(6) << '\n';
+                if (auto_player_) {
+                    auto_player_->on_error_received();
+                }
             } else {
                 std::cout << "[SERVER] " << *line << '\n';
             }
@@ -597,7 +645,13 @@ class ContrastClient {
                 std::cout << "[LOCAL] Invalid move: " << ex.what() << '\n';
                 continue;
             }
-            safe_send("MOVE " + line + "\n");
+            // Append game_id and move_id if available to make moves idempotent
+            std::string payload = "MOVE " + line;
+            if (current_game_id_ != 0) {
+                payload += " " + std::to_string(current_game_id_) + " " + std::to_string(next_move_id_++);
+            }
+            payload += "\n";
+            safe_send(payload);
         }
         running_ = false;
     }
@@ -645,6 +699,8 @@ class ContrastClient {
     std::unique_ptr<AutoPlayer> auto_player_;
     char assigned_role_{'?'};
     std::string last_status_{""};
+    uint64_t current_game_id_{0};
+    uint64_t next_move_id_{1};
     int num_games_{1};
     int games_played_{0};
 };
