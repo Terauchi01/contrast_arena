@@ -65,6 +65,9 @@ std::optional<std::string> recv_line(int socket, std::string& buffer) {
         if (newline_pos != std::string::npos) {
             std::string line = buffer.substr(0, newline_pos);
             buffer.erase(0, newline_pos + 1);
+            if (!std::getenv("CONTRAST_SILENT")) {
+                std::cerr << "[NET RECV] " << line << std::endl;
+            }
             return line;
         }
         char chunk[512];
@@ -90,6 +93,12 @@ std::optional<std::string> recv_line(int socket, std::string& buffer) {
 void send_all(int socket, const std::string& payload) {
     const char* data = payload.data();
     ssize_t remaining = static_cast<ssize_t>(payload.size());
+    if (!std::getenv("CONTRAST_SILENT")) {
+        // Log trimmed payload (avoid huge dumps)
+        std::string out = payload;
+        if (out.size() > 200) out = out.substr(0,200) + "...";
+        std::cerr << "[NET SEND] " << out << std::endl;
+    }
     while (remaining > 0) {
         const ssize_t sent = ::send(socket, data, remaining, 0);
         if (sent <= 0) {
@@ -262,7 +271,44 @@ class AlphaBetaAdapter final : public PolicyAdapter {
         }
     }
     contrast::Move pick(const contrast::GameState& state) override {
-        return alphabeta_.search(state, depth_, -1);
+        if (!std::getenv("CONTRAST_SILENT")) {
+            std::cerr << "[AlphaBeta DEBUG] Current player: " 
+                      << (state.current_player() == contrast::Player::Black ? "X" : "O") << "\n";
+            std::cerr << "[AlphaBeta DEBUG] Board state:\n";
+            const auto& board = state.board();
+            for (int y = 0; y < board.height(); ++y) {
+                std::cerr << "  ";
+                for (int x = 0; x < board.width(); ++x) {
+                    const auto& cell = board.at(x, y);
+                    char piece = '-';
+                    if (cell.occupant == contrast::Player::Black) piece = 'X';
+                    else if (cell.occupant == contrast::Player::White) piece = 'O';
+                    char tile = '.';
+                    if (cell.tile == contrast::TileType::Black) tile = 'b';
+                    else if (cell.tile == contrast::TileType::Gray) tile = 'g';
+                    std::cerr << piece << tile << " ";
+                }
+                std::cerr << "\n";
+            }
+            std::cerr << "[AlphaBeta DEBUG] Stock: X(b:" 
+                      << state.inventory(contrast::Player::Black).black
+                      << " g:" << state.inventory(contrast::Player::Black).gray
+                      << ") O(b:" << state.inventory(contrast::Player::White).black
+                      << " g:" << state.inventory(contrast::Player::White).gray << ")\n";
+        }
+        auto move = alphabeta_.search(state, depth_, -1);
+        if (!std::getenv("CONTRAST_SILENT")) {
+            std::cerr << "[AlphaBeta DEBUG] Selected move: " 
+                      << xy_to_coord(move.sx, move.sy) << "," 
+                      << xy_to_coord(move.dx, move.dy);
+            if (move.place_tile) {
+                std::cerr << " " << xy_to_coord(move.tx, move.ty) << tile_to_char(move.tile);
+            } else {
+                std::cerr << " -1";
+            }
+            std::cerr << "\n";
+        }
+        return move;
     }
 
    private:
@@ -272,7 +318,7 @@ class AlphaBetaAdapter final : public PolicyAdapter {
 
 class MCTSAdapter final : public PolicyAdapter {
    public:
-    MCTSAdapter(int iterations = 400) : iterations_(iterations) {
+    MCTSAdapter(int iterations = 10000) : iterations_(iterations) {
         // Load weights from the trained file
         const std::string weights_path = "ai/bin/ntuple_weights_vs_rulebased_swap.bin.100000";
         mcts_.load_network(weights_path);
@@ -405,6 +451,22 @@ class AutoPlayer {
             }
         }
         const contrast::GameState state = snapshot_to_state(snapshot);
+        const uint64_t state_hash = state.compute_hash();
+        if (!std::getenv("CONTRAST_SILENT")) {
+            if (last_snapshot_hash_ == 0) {
+                std::cerr << "[STATE APPLY] game=" << snapshot.game_id << " hash=" << state_hash << " (initial)" << std::endl;
+            } else if (last_snapshot_hash_ != state_hash) {
+                std::cerr << "[STATE APPLY] game=" << snapshot.game_id << " hash changed " << last_snapshot_hash_ << " -> " << state_hash << std::endl;
+            } else {
+                std::cerr << "[STATE APPLY] game=" << snapshot.game_id << " hash unchanged " << state_hash << std::endl;
+            }
+            // Compare server's reported last_move with our last_sent_text_
+            if (!last_sent_text_.empty()) {
+                const bool equal = (snapshot.last_move == last_sent_text_);
+                std::cerr << "[STATE CHECK] server_last_move='" << snapshot.last_move << "' matches_last_sent=" << (equal ? "yes" : "no") << std::endl;
+            }
+        }
+        last_snapshot_hash_ = state_hash;
         const contrast::Move move = policy_->pick(state);
         if (move.sx < 0 || move.dx < 0) {
             return;
@@ -434,6 +496,7 @@ class AutoPlayer {
     std::string last_sent_text_;
     std::string last_rejected_text_;
     bool suppress_until_next_state_{false};
+    uint64_t last_snapshot_hash_{0};
 };
 
 class ContrastClient {
@@ -552,8 +615,19 @@ class ContrastClient {
                     protocol::StateSnapshot snapshot = protocol::parse_state_block(block);
                     // Update client's notion of current game id and reset move counter on change
                     if (snapshot.game_id != current_game_id_) {
+                        uint64_t prev_game = current_game_id_;
+                        uint64_t prev_next = next_move_id_;
                         current_game_id_ = snapshot.game_id;
                         next_move_id_ = 1;
+                        if (std::getenv("CONTRAST_DEBUG")) {
+                            std::cerr << "[STATE META] game_id " << prev_game << " -> " << current_game_id_
+                                      << ", next_move_id reset " << prev_next << " -> " << next_move_id_ << std::endl;
+                        }
+                    } else {
+                        if (std::getenv("CONTRAST_DEBUG")) {
+                            std::cerr << "[STATE META] game_id unchanged: " << current_game_id_
+                                      << ", next_move_id=" << next_move_id_ << std::endl;
+                        }
                     }
                     // Board ASCII output commented out to reduce log noise
                     // std::cout << "\n=== STATE ===\n";

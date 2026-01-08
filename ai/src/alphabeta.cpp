@@ -195,6 +195,9 @@ float AlphaBeta::alphabeta(const GameState& state, int depth, float alpha, float
   
   order_moves(moves, state);
   
+  // 探索前のalphaを保存（置換表のフラグ判定に使用）
+  const float original_alpha = alpha;
+  
   float best_value = -std::numeric_limits<float>::infinity();
   Move local_best_move = moves[0];
   
@@ -221,9 +224,9 @@ float AlphaBeta::alphabeta(const GameState& state, int depth, float alpha, float
   
   best_move = local_best_move;
   
-  // 置換表に保存
+  // 置換表に保存（探索前のalphaと比較）
   TranspositionEntry::Flag flag = TranspositionEntry::Flag::EXACT;
-  if (best_value <= alpha) {
+  if (best_value <= original_alpha) {
     flag = TranspositionEntry::Flag::UPPER_BOUND;
   } else if (best_value >= beta) {
     flag = TranspositionEntry::Flag::LOWER_BOUND;
@@ -311,6 +314,9 @@ Move AlphaBeta::iterative_deepening_time(const GameState& state,
  */
 Move AlphaBeta::search(const GameState& s, int max_depth, int time_ms) {
   stats_.reset();
+  
+  // Clear transposition table to avoid stale entries from previous games
+  clear_transposition_table();
   
   // Determine effective time limit (ms). If time_ms <= 0, allow env var CONTRAST_MOVE_TIME (seconds).
   int effective_time_ms = time_ms;

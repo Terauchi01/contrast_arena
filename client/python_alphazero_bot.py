@@ -243,8 +243,8 @@ class AlphaZeroClient:
                     game.tile_counts.copy()
                 ))
             
-            # MCTS search
-            policy, _ = self.mcts.search(game, self.num_simulations)
+            # MCTS search with a 0.1s time budget
+            policy, _ = self.mcts.search(game, self.num_simulations, time_budget=0.1)
             
             if not policy:
                 if not os.getenv("CONTRAST_SILENT"):
@@ -335,7 +335,7 @@ def main():
     parser.add_argument("--role", default="X")
     parser.add_argument("--name", default="AlphaZero")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--simulations", type=int, default=100)
+    parser.add_argument("--simulations", type=int, default=10000)
     parser.add_argument("--games", type=int, default=1, help="Number of games to play")
     args = parser.parse_args()
     

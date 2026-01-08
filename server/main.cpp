@@ -338,6 +338,12 @@ bool all_players_ready() {
 void send_all(int socket, const std::string& payload) {
     const char* data = payload.data();
     ssize_t remaining = static_cast<ssize_t>(payload.size());
+    // Raw network debug output
+    if (std::getenv("CONTRAST_DEBUG")) {
+        std::string out = payload;
+        if (out.size() > 400) out = out.substr(0,400) + "...";
+        std::cerr << "[NET OUT] " << out << std::endl;
+    }
     while (remaining > 0) {
         const ssize_t sent = ::send(socket, data, remaining, 0);
         if (sent <= 0) {
@@ -354,6 +360,9 @@ std::optional<std::string> recv_line(int socket, std::string& buffer) {
         if (newline_pos != std::string::npos) {
             std::string line = buffer.substr(0, newline_pos);
             buffer.erase(0, newline_pos + 1);
+            if (std::getenv("CONTRAST_DEBUG")) {
+                std::cerr << "[NET IN] " << line << std::endl;
+            }
             return line;
         }
         char chunk[512];
@@ -378,6 +387,9 @@ std::optional<std::string> recv_line(int socket, std::string& buffer) {
 
 void send_state_to(int socket, const protocol::StateSnapshot& snapshot) {
     const std::string message = protocol::build_state_message(snapshot);
+    if (std::getenv("CONTRAST_DEBUG")) {
+        std::cerr << "[STATE SEND -> sock=" << socket << "] game=" << snapshot.game_id << " last_move='" << snapshot.last_move << "'" << std::endl;
+    }
     send_all(socket, message);
 }
 
@@ -391,6 +403,9 @@ void broadcast_state(const protocol::StateSnapshot& snapshot) {
             continue;
         }
         try {
+            if (std::getenv("CONTRAST_DEBUG")) {
+                std::cerr << "[STATE BROADCAST] to role=" << session->role << " name=" << session->name << " sock=" << session->socket << " game=" << snapshot.game_id << " last_move='" << snapshot.last_move << "'" << std::endl;
+            }
             send_all(session->socket, message);
             ++it;
         } catch (...) {

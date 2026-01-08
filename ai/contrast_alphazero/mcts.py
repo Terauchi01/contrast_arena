@@ -78,12 +78,13 @@ class MCTS:
             game.move_count,  # <--- 重要: これを追加
         )
 
-    def search(self, root_game: ContrastGame, num_simulations: int):
+    def search(self, root_game: ContrastGame, num_simulations: int = None, time_budget: float = None):
         """ルートノードからMCTS探索を実行
 
         Args:
             root_game: 探索を開始するゲーム状態
-            num_simulations: 実行するシミュレーション回数
+            num_simulations: 実行するシミュレーション回数 (Noneの場合は無制限にできる)
+            time_budget: 探索に使う最大時間(秒)。指定した場合、指定時間経過するまで探索を行う。
 
         Returns:
             (mcts_policy, action_values):
@@ -112,7 +113,7 @@ class MCTS:
 
         if self.verbose:
             logger.debug(
-                f"MCTS search started: {num_simulations} simulations, "
+                f"MCTS search started: simulations={num_simulations}, time_budget={time_budget}, "
                 f"{len(valid_actions)} legal actions"
             )
 
@@ -124,10 +125,30 @@ class MCTS:
             ] + self.eps * dirichlet_noise[i]
 
         # シミュレーション実行
-        for sim_idx in range(num_simulations):
-            # ルートからの探索を開始 (コピーを使用)
-            self._evaluate(root_game.copy())
-            self.search_stats["total_simulations"] += 1
+        # If time_budget is specified, run until the budget elapses.
+        import time
+        start_time = time.time()
+
+        if time_budget is not None:
+            # Run until time expires. If num_simulations is also provided, it acts as an upper bound.
+            sim_idx = 0
+            while True:
+                # Respect optional simulation upper bound
+                if num_simulations is not None and sim_idx >= num_simulations:
+                    break
+                # Check time budget
+                if time.time() - start_time >= time_budget:
+                    break
+                self._evaluate(root_game.copy())
+                sim_idx += 1
+                self.search_stats["total_simulations"] += 1
+        else:
+            # Use simulation count (may be None -> treat as 0)
+            sims = 0 if num_simulations is None else num_simulations
+            for sim_idx in range(sims):
+                # ルートからの探索を開始 (コピーを使用)
+                self._evaluate(root_game.copy())
+                self.search_stats["total_simulations"] += 1
 
         # 訪問回数に基づいたPolicyを返す
         root_visits = sum(self.N[root_key].values())

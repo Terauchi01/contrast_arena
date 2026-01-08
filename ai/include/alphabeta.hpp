@@ -43,6 +43,7 @@ public:
   void set_use_transposition_table(bool use) { use_tt_ = use; }
   void set_use_move_ordering(bool use) { use_move_ordering_ = use; }
   void set_verbose(bool v) { verbose_ = v; }
+  void clear_transposition_table() { tt_.clear(); }
   
   // 統計情報
   struct Stats {
