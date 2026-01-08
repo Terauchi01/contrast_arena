@@ -18,4 +18,13 @@ struct Move {
   TileType tile = TileType::None;
 };
 
+inline bool operator==(const Move& a, const Move& b) {
+  return a.sx == b.sx && a.sy == b.sy && a.dx == b.dx && a.dy == b.dy
+      && a.place_tile == b.place_tile && a.tx == b.tx && a.ty == b.ty && a.tile == b.tile;
+}
+
+inline bool operator!=(const Move& a, const Move& b) {
+  return !(a == b);
+}
+
 } // namespace contrast

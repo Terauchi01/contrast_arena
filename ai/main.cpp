@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
         white_ab_ptr->load_network(weights_path);
         white_binding.name = "AlphaBeta";
         white_binding.pick = [m = white_ab_ptr.get()](const GameState& state) {
-            return m->search(state, 3, 0);
+            return m->search(state, 5, 0);
         };
     } else {
         white_binding = make_binding(white_choice, white_rule_policy, white_random_policy);

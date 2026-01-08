@@ -71,41 +71,67 @@ for p in $(seq "$PORT" $((PORT + 3))); do
 	fi
 done
 
-# Three matches -> three servers
+# Three matches -> run sequentially: start server, start two clients, wait at connect time, then continue
 PORT1=${PORT}
 PORT2=$((PORT + 1))
 PORT3=$((PORT + 2))
 
-echo "Starting servers on ports $PORT1,$PORT2,$PORT3 for machine3"
-"$SERVER_APP" --port "$PORT1" > "$LOGDIR/server1.log" 2>&1 &
-SERVER1_PID=$!
-"$SERVER_APP" --port "$PORT2" > "$LOGDIR/server2.log" 2>&1 &
-SERVER2_PID=$!
-"$SERVER_APP" --port "$PORT3" > "$LOGDIR/server3.log" 2>&1 &
-SERVER3_PID=$!
-sleep 0.5
+echo "Running 3 matches sequentially on ports $PORT1,$PORT2,$PORT3 for machine3"
+SERVER_PIDS=()
+CLIENT_PIDS=()
+for i in 1 2 3; do
+	case "$i" in
+		1)
+			P=$PORT1
+			echo "Match #$i: alphabeta vs mcts on port $P"
+			CMD1=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" X alphabeta_X alphabeta "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O mcts_O mcts "$GAMES")
+			LOG1="$LOGDIR/alphabeta_vs_mcts_X.log"
+			LOG2="$LOGDIR/alphabeta_vs_mcts_O.log"
+			;;
+		2)
+			P=$PORT2
+			echo "Match #$i: alphazero vs alphazero on port $P"
+			CMD1=("$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$P" --role X --name az1 --games "$GAMES")
+			CMD2=("$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$P" --role O --name az2 --games "$GAMES")
+			LOG1="$LOGDIR/alphazero_vs_alphazero_X.log"
+			LOG2="$LOGDIR/alphazero_vs_alphazero_O.log"
+			;;
+		3)
+			P=$PORT3
+			echo "Match #$i: ntuple vs mcts on port $P"
+			CMD1=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" X ntuple_X2 ntuple "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O mcts_O2 mcts "$GAMES")
+			LOG1="$LOGDIR/ntuple_vs_mcts_X.log"
+			LOG2="$LOGDIR/ntuple_vs_mcts_O.log"
+			;;
+	esac
 
-echo "alphabeta vs mcts on port $PORT1"
-env CONTRAST_SERVER_PORT="$PORT1" "$CLIENT_APP" X alphabeta_X alphabeta "$GAMES" > "$LOGDIR/alphabeta_vs_mcts_X.log" 2>&1 &
-CLIENT1=$!
-env CONTRAST_SERVER_PORT="$PORT1" "$CLIENT_APP" O mcts_O mcts "$GAMES" > "$LOGDIR/alphabeta_vs_mcts_O.log" 2>&1 &
-CLIENT2=$!
+	echo " Starting server on port $P"
+	"$SERVER_APP" --port "$P" > "$LOGDIR/server${i}.log" 2>&1 &
+	SERVER_PID=$!
+	sleep 0.5
 
-echo "alphazero vs alphazero on port $PORT2"
-"$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$PORT2" --role X --name az1 --games "$GAMES" > "$LOGDIR/alphazero_vs_alphazero_X.log" 2>&1 &
-CLIENT3=$!
-"$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$PORT2" --role O --name az2 --games "$GAMES" > "$LOGDIR/alphazero_vs_alphazero_O.log" 2>&1 &
-CLIENT4=$!
+	echo "  Starting clients for match #$i (background, staggered)"
+	("${CMD1[@]}" > "$LOG1" 2>&1) &
+	CLIENT1_PID=$!
+	sleep 0.5
+	("${CMD2[@]}" > "$LOG2" 2>&1) &
+	CLIENT2_PID=$!
 
-echo "ntuple vs mcts on port $PORT3"
-env CONTRAST_SERVER_PORT="$PORT3" "$CLIENT_APP" X ntuple_X2 ntuple "$GAMES" > "$LOGDIR/ntuple_vs_mcts_X.log" 2>&1 &
-CLIENT5=$!
-env CONTRAST_SERVER_PORT="$PORT3" "$CLIENT_APP" O mcts_O2 mcts "$GAMES" > "$LOGDIR/ntuple_vs_mcts_O.log" 2>&1 &
-CLIENT6=$!
+	SERVER_PIDS+=("$SERVER_PID")
+	CLIENT_PIDS+=("$CLIENT1_PID" "$CLIENT2_PID")
+	sleep 1
+done
 
-wait $CLIENT1 $CLIENT2 $CLIENT3 $CLIENT4 $CLIENT5 $CLIENT6 || true
+echo "All matches started; waiting for clients to finish..."
+if [ "${#CLIENT_PIDS[@]}" -gt 0 ]; then
+	wait "${CLIENT_PIDS[@]}" || true
+fi
 
-echo "Stopping servers (PIDs $SERVER1_PID $SERVER2_PID $SERVER3_PID)"
-kill $SERVER1_PID $SERVER2_PID $SERVER3_PID || true
-wait $SERVER1_PID $SERVER2_PID $SERVER3_PID 2>/dev/null || true
+echo "Stopping servers (PIDs ${SERVER_PIDS[*]})"
+for pid in "${SERVER_PIDS[@]}"; do
+	kill "$pid" 2>/dev/null || true
+done
+wait "${SERVER_PIDS[@]}" 2>/dev/null || true
 echo "machine3 done"

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <iostream>
 #include <functional>
+#include <cstdlib>
+#include <string>
 
 using namespace contrast_ai;
 using namespace contrast;
@@ -90,27 +92,23 @@ uint64_t AlphaBeta::compute_hash(const GameState& state) const {
 }
 
 void AlphaBeta::order_moves(std::vector<Move>& moves, const GameState& state) {
-  if (!use_move_ordering_ || moves.size() <= 1) {
-    return;
+  if (!use_move_ordering_ || moves.size() <= 1) return;
+
+  // Lightweight ordering: prefer the transposition-table best_move (if present)
+  // to avoid costly state copies and evaluations here.
+  uint64_t hash = compute_hash(state);
+  auto it = tt_.find(hash);
+  if (it != tt_.end()) {
+    const Move& tt_best = it->second.best_move;
+    for (size_t i = 0; i < moves.size(); ++i) {
+      if (moves[i] == tt_best) {
+        if (i != 0) std::swap(moves[0], moves[i]);
+        return;
+      }
+    }
   }
-  
-  // 各手の評価値を計算して降順ソート
-  std::vector<std::pair<float, Move>> scored_moves;
-  scored_moves.reserve(moves.size());
-  
-  for (const auto& move : moves) {
-    GameState next_state = state;
-    next_state.apply_move(move);
-    float score = -evaluate_state(next_state);  // Negamax形式
-    scored_moves.emplace_back(score, move);
-  }
-  
-  std::sort(scored_moves.begin(), scored_moves.end(),
-            [](const auto& a, const auto& b) { return a.first > b.first; });
-  
-  for (size_t i = 0; i < moves.size(); ++i) {
-    moves[i] = scored_moves[i].second;
-  }
+
+  // Fallback: keep original order (do not do expensive full evaluation here)
 }
 
 void AlphaBeta::store_tt(uint64_t hash, float value, int depth, 
@@ -201,20 +199,34 @@ float AlphaBeta::alphabeta(const GameState& state, int depth, float alpha, float
   float best_value = -std::numeric_limits<float>::infinity();
   Move local_best_move = moves[0];
   
+  bool first_child = true;
   for (const auto& move : moves) {
     GameState next_state = state;
     next_state.apply_move(move);
-    
+
     Move child_best_move;
-    float value = -alphabeta(next_state, depth - 1, -beta, -alpha, !maximizing, child_best_move);
-    
+    float value;
+
+    if (first_child) {
+      // full-window search for first child
+      value = -alphabeta(next_state, depth - 1, -beta, -alpha, !maximizing, child_best_move);
+      first_child = false;
+    } else {
+      // Principal Variation Search (Negascout): null-window search then re-search if needed
+      value = -alphabeta(next_state, depth - 1, -alpha - 1.0f, -alpha, !maximizing, child_best_move);
+      if (value > alpha && value < beta) {
+        // research with full window
+        value = -alphabeta(next_state, depth - 1, -beta, -alpha, !maximizing, child_best_move);
+      }
+    }
+
     if (value > best_value) {
       best_value = value;
       local_best_move = move;
     }
-    
+
     alpha = std::max(alpha, value);
-    
+
     // ベータカット
     if (alpha >= beta) {
       stats_.beta_cutoffs++;
@@ -243,19 +255,32 @@ float AlphaBeta::alphabeta(const GameState& state, int depth, float alpha, float
  */
 Move AlphaBeta::iterative_deepening(const GameState& state, int max_depth) {
   Move best_move;
-  
-  std::cerr << "[AlphaBeta] Iterative deepening up to depth " << max_depth << std::endl;
+  auto minimal_mode = []() -> bool {
+    const char* e = std::getenv("CONTRAST_MINIMAL");
+    if (!e) return true; // default: minimal mode ON
+    std::string s(e);
+    if (s == "0" || s == "false" || s == "False") return false;
+    return true;
+  };
+
+  if (!minimal_mode()) {
+    std::cerr << "[AlphaBeta] Iterative deepening up to depth " << max_depth << std::endl;
+  }
   
   for (int d = 1; d <= max_depth; ++d) {
     stats_.max_depth_reached = d;
     
-    std::cerr << "[AlphaBeta] Searching depth " << d << "/" << max_depth << "..." << std::flush;
+    if (!minimal_mode()) {
+      std::cerr << "[AlphaBeta] Searching depth " << d << "/" << max_depth << "..." << std::flush;
+    }
     
     Move current_best;
     float value = alphabeta(state, d, -std::numeric_limits<float>::infinity(), 
                            std::numeric_limits<float>::infinity(), true, current_best);
     
-    std::cerr << " done! (nodes: " << stats_.nodes_searched << ", value: " << value << ")" << std::endl;
+    if (!minimal_mode()) {
+      std::cerr << " done! (nodes: " << stats_.nodes_searched << ", value: " << value << ")" << std::endl;
+    }
     
     if (verbose_) {
       std::cout << "[AlphaBeta] Depth " << d << " | Value: " << value 
@@ -276,6 +301,12 @@ Move AlphaBeta::iterative_deepening(const GameState& state, int max_depth) {
 Move AlphaBeta::iterative_deepening_time(const GameState& state, 
                                          std::chrono::steady_clock::time_point deadline) {
   Move best_move;
+  auto minimal_mode = []() -> bool {
+    const char* e = std::getenv("CONTRAST_MINIMAL");
+    if (!e) return false;
+    std::string s(e);
+    return !(s.empty() || s == "0");
+  };
   int depth = 1;
   
   while (std::chrono::steady_clock::now() < deadline) {
@@ -316,7 +347,10 @@ Move AlphaBeta::search(const GameState& s, int max_depth, int time_ms) {
   stats_.reset();
   
   // Clear transposition table to avoid stale entries from previous games
-  clear_transposition_table();
+  // NOTE: clearing the transposition table here (per-search) is expensive
+  // and reduces the effectiveness of TT across iterative deepening.
+  // For better performance we avoid clearing here and expect callers to
+  // call `clear_transposition_table()` once per game when appropriate.
   
   // Determine effective time limit (ms). If time_ms <= 0, allow env var CONTRAST_MOVE_TIME (seconds).
   int effective_time_ms = time_ms;
@@ -328,7 +362,16 @@ Move AlphaBeta::search(const GameState& s, int max_depth, int time_ms) {
     }
   }
 
-  std::cerr << "[AlphaBeta] Starting search (depth=" << max_depth << ", time_ms=" << effective_time_ms << ")..." << std::endl;
+  auto minimal_mode = []() -> bool {
+    const char* e = std::getenv("CONTRAST_MINIMAL");
+    if (!e) return false;
+    std::string s(e);
+    return !(s.empty() || s == "0");
+  };
+
+  if (!minimal_mode()) {
+    std::cerr << "[AlphaBeta] Starting search (depth=" << max_depth << ", time_ms=" << effective_time_ms << ")..." << std::endl;
+  }
 
   if (effective_time_ms > 0) {
     // 時間指定の場合は反復深化
@@ -339,9 +382,11 @@ Move AlphaBeta::search(const GameState& s, int max_depth, int time_ms) {
     auto end_time = std::chrono::steady_clock::now();
     stats_.time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
     
-    std::cerr << "[AlphaBeta] Search complete | Depth: " << stats_.max_depth_reached
-              << " | Nodes: " << stats_.nodes_searched
-              << " | Time: " << stats_.time_ms << "ms" << std::endl;
+    if (!minimal_mode()) {
+      std::cerr << "[AlphaBeta] Search complete | Depth: " << stats_.max_depth_reached
+                << " | Nodes: " << stats_.nodes_searched
+                << " | Time: " << stats_.time_ms << "ms" << std::endl;
+    }
     
     if (verbose_) {
       std::cout << "[AlphaBeta] Search complete | Depth: " << stats_.max_depth_reached

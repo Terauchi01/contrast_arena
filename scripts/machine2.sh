@@ -71,52 +71,78 @@ for p in $(seq "$PORT" $((PORT + 3))); do
 	fi
 done
 
-# Determine number of matches (4) and start one server per match on consecutive ports
+# Four matches -> run sequentially: start server, start two clients, wait, stop server
 PORT1=${PORT}
 PORT2=$((PORT + 1))
 PORT3=$((PORT + 2))
 PORT4=$((PORT + 3))
 
-echo "Starting servers on ports $PORT1,$PORT2,$PORT3,$PORT4 for machine2"
-"$SERVER_APP" --port "$PORT1" > "$LOGDIR/server1.log" 2>&1 &
-SERVER1_PID=$!
-"$SERVER_APP" --port "$PORT2" > "$LOGDIR/server2.log" 2>&1 &
-SERVER2_PID=$!
-"$SERVER_APP" --port "$PORT3" > "$LOGDIR/server3.log" 2>&1 &
-SERVER3_PID=$!
-"$SERVER_APP" --port "$PORT4" > "$LOGDIR/server4.log" 2>&1 &
-SERVER4_PID=$!
-sleep 0.5
+echo "Running 4 matches sequentially on ports $PORT1,$PORT2,$PORT3,$PORT4 for machine2"
+SERVER_PIDS=()
+CLIENT_PIDS=()
+for i in 1 2 3 4; do
+	case "$i" in
+		1)
+			P=$PORT1
+			echo "Match #$i: alphabeta vs alphabeta on port $P"
+			CMD1=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" X alphabeta_A alphabeta "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O alphabeta_B alphabeta "$GAMES")
+			LOG1="$LOGDIR/alphabeta_vs_alphabeta_X.log"
+			LOG2="$LOGDIR/alphabeta_vs_alphabeta_O.log"
+			;;
+		2)
+			P=$PORT2
+			echo "Match #$i: alphazero vs alphabeta on port $P"
+			CMD1=("$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$P" --role X --name alphazero_X --games "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O alphabeta_O alphabeta "$GAMES")
+			LOG1="$LOGDIR/alphazero_vs_alphabeta_X.log"
+			LOG2="$LOGDIR/alphazero_vs_alphabeta_O.log"
+			;;
+		3)
+			P=$PORT3
+			echo "Match #$i: ntuple vs alphabeta on port $P"
+			CMD1=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" X ntuple_X ntuple "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O alphabeta_O2 alphabeta "$GAMES")
+			LOG1="$LOGDIR/ntuple_vs_alphabeta_X.log"
+			LOG2="$LOGDIR/ntuple_vs_alphabeta_O.log"
+			;;
+		4)
+			P=$PORT4
+			echo "Match #$i: rulebased2 vs rulebased2 on port $P"
+			CMD1=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" X rulebased2_A rulebased2 "$GAMES")
+			CMD2=(env CONTRAST_SERVER_PORT="$P" "$CLIENT_APP" O rulebased2_B rulebased2 "$GAMES")
+			LOG1="$LOGDIR/rulebased2_vs_rulebased2_X.log"
+			LOG2="$LOGDIR/rulebased2_vs_rulebased2_O.log"
+			;;
+	esac
 
-echo "Starting alphabeta vs alphabeta on port $PORT1"
-env CONTRAST_SERVER_PORT="$PORT1" "$CLIENT_APP" X alphabeta_A alphabeta "$GAMES" > "$LOGDIR/alphabeta_vs_alphabeta_X.log" 2>&1 &
-CLIENT1=$!
-env CONTRAST_SERVER_PORT="$PORT1" "$CLIENT_APP" O alphabeta_B alphabeta "$GAMES" > "$LOGDIR/alphabeta_vs_alphabeta_O.log" 2>&1 &
-CLIENT2=$!
+	echo " Starting server on port $P"
+	"$SERVER_APP" --port "$P" > "$LOGDIR/server${i}.log" 2>&1 &
+	SERVER_PID=$!
+	sleep 0.5
 
-echo "Starting alphazero vs alphabeta on port $PORT2"
-"$VENV_PY" "$ALPHAZERO_BOT" --host 127.0.0.1 --port "$PORT2" --role X --name alphazero_X --games "$GAMES" > "$LOGDIR/alphazero_vs_alphabeta_X.log" 2>&1 &
-CLIENT3=$!
-env CONTRAST_SERVER_PORT="$PORT2" "$CLIENT_APP" O alphabeta_O --name alphabeta_O --games "$GAMES" >/dev/null 2>&1 || true
-# Note: the C++ client invocation for alphabeta as O should use env CONTRAST_SERVER_PORT
-env CONTRAST_SERVER_PORT="$PORT2" "$CLIENT_APP" O alphabeta_O alphabeta "$GAMES" > "$LOGDIR/alphazero_vs_alphabeta_O.log" 2>&1 &
-CLIENT4=$!
+	echo "  Starting clients for match #$i (background, staggered)"
+	("${CMD1[@]}" > "$LOG1" 2>&1) &
+	CLIENT1_PID=$!
+	sleep 0.5
+	("${CMD2[@]}" > "$LOG2" 2>&1) &
+	CLIENT2_PID=$!
 
-echo "Starting ntuple vs alphabeta on port $PORT3"
-env CONTRAST_SERVER_PORT="$PORT3" "$CLIENT_APP" X ntuple_X ntuple "$GAMES" > "$LOGDIR/ntuple_vs_alphabeta_X.log" 2>&1 &
-CLIENT5=$!
-env CONTRAST_SERVER_PORT="$PORT3" "$CLIENT_APP" O alphabeta_O2 alphabeta "$GAMES" > "$LOGDIR/ntuple_vs_alphabeta_O.log" 2>&1 &
-CLIENT6=$!
+	# record pids and sleep briefly to allow initial connections
+	SERVER_PIDS+=("$SERVER_PID")
+	CLIENT_PIDS+=("$CLIENT1_PID" "$CLIENT2_PID")
+	sleep 1
+done
 
-echo "Starting rulebased2 vs rulebased2 on port $PORT4"
-env CONTRAST_SERVER_PORT="$PORT4" "$CLIENT_APP" X rulebased2_A rulebased2 "$GAMES" > "$LOGDIR/rulebased2_vs_rulebased2_X.log" 2>&1 &
-CLIENT7=$!
-env CONTRAST_SERVER_PORT="$PORT4" "$CLIENT_APP" O rulebased2_B rulebased2 "$GAMES" > "$LOGDIR/rulebased2_vs_rulebased2_O.log" 2>&1 &
-CLIENT8=$!
+echo "All matches started; waiting for clients to finish..."
+if [ "${#CLIENT_PIDS[@]}" -gt 0 ]; then
+	wait "${CLIENT_PIDS[@]}" || true
+fi
 
-wait $CLIENT1 $CLIENT2 $CLIENT3 $CLIENT4 $CLIENT5 $CLIENT6 $CLIENT7 $CLIENT8 || true
+echo "Stopping servers (PIDs ${SERVER_PIDS[*]})"
+for pid in "${SERVER_PIDS[@]}"; do
+	kill "$pid" 2>/dev/null || true
+done
+wait "${SERVER_PIDS[@]}" 2>/dev/null || true
 
-echo "Stopping servers (PIDs $SERVER1_PID $SERVER2_PID $SERVER3_PID $SERVER4_PID)"
-kill $SERVER1_PID $SERVER2_PID $SERVER3_PID $SERVER4_PID || true
-wait $SERVER1_PID $SERVER2_PID $SERVER3_PID $SERVER4_PID 2>/dev/null || true
 echo "machine2 done"

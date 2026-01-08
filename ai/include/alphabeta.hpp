@@ -97,6 +97,8 @@ private:
   bool use_move_ordering_;
   bool verbose_;
   Stats stats_;
+  // root player for perspective normalization during a search
+  contrast::Player root_player_ = contrast::Player::Black;
 };
 
 } // namespace contrast_ai

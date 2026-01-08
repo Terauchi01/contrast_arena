@@ -19,6 +19,9 @@ from mcts import MCTS
 BOARD_SIZE = 5
 HISTORY_SIZE = 8
 
+# Verbosity flag: respect CONTRAST_SILENT or CONTRAST_MINIMAL
+VERBOSE = not (os.getenv("CONTRAST_SILENT") or os.getenv("CONTRAST_MINIMAL"))
+
 
 def coord_to_xy(coord):
     """Protocol coord 'a1' -> (x, protocol_y)"""
@@ -179,10 +182,10 @@ class AlphaZeroClient:
         if Path(model_path).exists():
             # load_state_dict expects the state dict; do not pass non-standard kwargs to torch.load
             self.model.load_state_dict(torch.load(model_path, map_location=device))
-            if not os.getenv("CONTRAST_SILENT"):
+            if VERBOSE:
                 print(f"[AlphaZero] Model loaded from {model_path}")
         else:
-            if not os.getenv("CONTRAST_SILENT"):
+            if VERBOSE:
                 print(f"[AlphaZero] Warning: Model not found at {model_path}")
         
         self.model.eval()
@@ -192,7 +195,7 @@ class AlphaZeroClient:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.connect((self.host, self.port))
         self.buffer = ""
-        if not os.getenv("CONTRAST_SILENT"):
+        if VERBOSE:
             print(f"Connected to {self.host}:{self.port}")
     
     def recv_line(self):
@@ -212,8 +215,7 @@ class AlphaZeroClient:
     
     def handle_state(self, lines):
         turn, status, pieces, tiles, stock_black, stock_gray = parse_state_block(lines)
-        
-        if not os.getenv("CONTRAST_SILENT"):
+        if VERBOSE:
             print(f"\n[STATE] Turn:{turn} Status:{status}")
         
         # Update last status
@@ -247,21 +249,21 @@ class AlphaZeroClient:
             policy, _ = self.mcts.search(game, self.num_simulations, time_budget=0.1)
             
             if not policy:
-                if not os.getenv("CONTRAST_SILENT"):
+                if VERBOSE:
                     print("[AlphaZero] No legal moves")
                 return
             
             best_action = max(policy.items(), key=lambda x: x[1])[0]
             move_str = action_to_protocol(best_action)
             
-            if not os.getenv("CONTRAST_SILENT"):
+            if VERBOSE:
                 print(f"[AlphaZero] Playing: {move_str}")
             self.send(f"MOVE {move_str}\n")
             self.awaiting = True
             self.last_game = game
             
         except Exception as e:
-            if not os.getenv("CONTRAST_SILENT"):
+            if VERBOSE:
                 print(f"[AlphaZero] Error: {e}")
                 import traceback
                 traceback.print_exc()
@@ -291,31 +293,31 @@ class AlphaZeroClient:
                     # Check if game just ended
                     if old_status == "ongoing" and self.last_status != "ongoing":
                         self.games_played += 1
-                        if not os.getenv("CONTRAST_SILENT"):
+                        if VERBOSE:
                             print(f"[AlphaZero] Game {self.games_played}/{self.num_games} finished: {self.last_status}")
                         
                         # Check if we should continue
                         if self.games_played < self.num_games:
-                            if not os.getenv("CONTRAST_SILENT"):
+                            if VERBOSE:
                                 print(f"[AlphaZero] Preparing for next game...")
                             self.history.clear()
                             self.last_game = None  # Reset last_game for new game
                             self.send("READY\n")
                         else:
-                            if not os.getenv("CONTRAST_SILENT"):
+                            if VERBOSE:
                                 print(f"[AlphaZero] All {self.num_games} games completed. Exiting.")
                             break
                 
                 elif line.startswith("INFO "):
                     msg = line[5:]
-                    if not os.getenv("CONTRAST_SILENT"):
+                    if VERBOSE:
                         print(f"[INFO] {msg}")
                     if msg.startswith("You are "):
                         self.my_role = msg[8:9].upper()
                 
                 elif line.startswith("ERROR "):
-                    if not os.getenv("CONTRAST_SILENT"):
-                        print(f"[ERROR] {line[6:]}")
+                    # Always show server ERROR messages
+                    print(f"[ERROR] {line[6:]}")
                 
                 else:
                     if not os.getenv("CONTRAST_SILENT"):
@@ -338,6 +340,10 @@ def main():
     parser.add_argument("--simulations", type=int, default=10000)
     parser.add_argument("--games", type=int, default=1, help="Number of games to play")
     args = parser.parse_args()
+
+    # Verbosity: if either CONTRAST_SILENT or CONTRAST_MINIMAL is set, be quiet
+    import os
+    VERBOSE = not (os.getenv("CONTRAST_SILENT") or os.getenv("CONTRAST_MINIMAL"))
     
     if args.model is None:
         # Use the top-level ai model file if present

@@ -15,6 +15,7 @@ if not files:
 for path in files:
     xwins = 0
     owins = 0
+    draws = 0
     try:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
@@ -25,7 +26,9 @@ for path in files:
                         xwins += 1
                     elif w == 'O':
                         owins += 1
+                    elif w == 'DRAW' or w == 'TIE':
+                        draws += 1
         rel = os.path.relpath(path)
-        print(f"{rel}\tX:{xwins}\tO:{owins}")
+        print(f"{rel}\tX:{xwins}\tO:{owins}\tD:{draws}")
     except Exception as e:
         print(f"# Failed to read {path}: {e}", file=sys.stderr)
